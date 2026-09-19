@@ -5,16 +5,21 @@ de riesgo; ninguno vuelve a calcular nada por su cuenta.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.risk import SAMPLE_SCENARIOS
 from app.schemas.risk import (
+    FactorDecompositionOut,
     RiskReport,
     SensitivityOut,
+    StressReportOut,
+    StressReportRequest,
     StressResultOut,
+    VaREngineRequest,
+    VaREngineResult,
     VaRRequest,
     VaRResult,
 )
@@ -70,6 +75,93 @@ def portfolio_var(
         var_value=measure.var,
         expected_shortfall=measure.expected_shortfall,
     )
+
+
+@router.post("/portfolios/{portfolio_id}/var/engine", response_model=VaREngineResult)
+def portfolio_var_engine(
+    portfolio_id: int,
+    params: VaREngineRequest,
+    db: Session = Depends(get_db),
+) -> VaREngineResult:
+    """Motor central: VaR + ES por segmento/confianza/horizonte con trazabilidad."""
+    try:
+        return RiskService(db).var_engine(
+            portfolio_id,
+            segment=params.segment,
+            confidence_level=params.confidence_level,
+            horizon_days=params.horizon_days,
+            lookback_days=params.lookback_days,
+            method=params.method.value,
+            n_simulations=params.n_simulations,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get(
+    "/portfolios/{portfolio_id}/var/factors", response_model=FactorDecompositionOut
+)
+def portfolio_var_factors(
+    portfolio_id: int,
+    confidence_level: float = Query(default=0.95, gt=0.5, lt=1.0),
+    horizon_days: int = Query(default=1, ge=1, le=30),
+    lookback_days: int = Query(default=252, ge=30),
+    db: Session = Depends(get_db),
+) -> FactorDecompositionOut:
+    """Contribución al VaR por factor y clase (Euler allocation sobre la covarianza)."""
+    try:
+        d = RiskService(db).decompose(
+            portfolio_id,
+            confidence_level=confidence_level,
+            horizon_days=horizon_days,
+            lookback_days=lookback_days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return FactorDecompositionOut(
+        target=d.portfolio_name,
+        portfolio_value=round(d.market_value, 2),
+        total_var=round(d.total_var, 2),
+        confidence_level=d.confidence_level,
+        horizon_days=d.horizon_days,
+        method=d.method,
+        classes=[
+            {"asset_class": c.asset_class, "exposure": round(c.exposure, 2),
+             "contribution": round(c.contribution, 2), "share": round(c.share, 6)}
+            for c in d.classes
+        ],
+        factors=[
+            {
+                "symbol": f.symbol, "asset_class": f.asset_class,
+                "exposure": round(f.exposure, 2),
+                "annualized_volatility": round(f.annualized_volatility, 6),
+                "delta": round(f.delta, 2), "gamma": round(f.gamma, 2),
+                "vega": round(f.vega, 2), "contribution": round(f.contribution, 2),
+                "share": round(f.share, 6),
+            }
+            for f in d.factors
+        ],
+    )
+
+
+@router.post("/portfolios/{portfolio_id}/stress/report", response_model=StressReportOut)
+def portfolio_stress_report(
+    portfolio_id: int,
+    params: StressReportRequest,
+    db: Session = Depends(get_db),
+) -> StressReportOut:
+    """Estrés de un escenario: baseline vs. estresado (valor, P&L y VaR)."""
+    try:
+        return RiskService(db).stress_report(
+            portfolio_id,
+            scenario_name=params.scenario_name,
+            shocks=params.shocks,
+            confidence_level=params.confidence_level,
+            horizon_days=params.horizon_days,
+            lookback_days=params.lookback_days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.get("/portfolios/{portfolio_id}/sensitivities", response_model=list[SensitivityOut])

@@ -70,6 +70,14 @@ class MarketDataTransformer:
         if "name" in df.columns:
             names = df.drop_duplicates("symbol").set_index("symbol")["name"]
             instruments["name"] = instruments["symbol"].map(names).fillna(instrument_defaults["name"])
+        for col in ("asset_class", "currency"):
+            if col in df.columns:
+                meta = df.drop_duplicates("symbol").set_index("symbol")[col]
+                if col == "asset_class":
+                    meta = meta.astype(str).str.strip().str.lower()
+                instruments[col] = (
+                    instruments["symbol"].map(meta).fillna(instrument_defaults[col])
+                )
 
         # 5. Rellenar fechas faltantes con forward-fill por símbolo,
         #    descartando series con demasiados huecos.

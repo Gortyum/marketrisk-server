@@ -35,7 +35,16 @@ def main() -> None:
         prices = gen_series(seed=100 + i, start=start, vol=vol, drift=drift)
         dates = pd.date_range(end=END, periods=DAYS, freq="B")
         for date, close in zip(dates, prices):
-            rows.append({"symbol": symbol, "name": name, "date": date, "close": round(close, 4)})
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": name,
+                    "asset_class": asset_class,
+                    "currency": "USD",
+                    "date": date,
+                    "close": round(close, 4),
+                }
+            )
 
     df = pd.DataFrame(rows)
     df.to_csv(f"{OUT}/sample_prices.csv", index=False)

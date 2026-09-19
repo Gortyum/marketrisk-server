@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -106,3 +107,158 @@ def test_full_flow(client: TestClient, sample_data_dir: Path):
     assert report["market_value"] > 0
     assert set(report["var_by_method"]) == {"historical", "parametric", "monte_carlo"}
     assert report["market_value"] > report["var_by_method"]["parametric"]
+
+
+def _seed_portfolio(client: TestClient) -> int:
+    """Sube la muestra completa y crea un portafolio con los 6 instrumentos."""
+    csv_path = Path(__file__).resolve().parent.parent / "data" / "sample" / "sample_prices.csv"
+    with open(csv_path, "rb") as f:
+        client.post("/etl/upload", files={"file": ("sample_prices.csv", f, "text/csv")})
+    instruments = client.get("/etl/instruments").json()
+    resp = client.post("/portfolios", json={"name": "Engine Port"})
+    assert resp.status_code == 201
+    portfolio_id = resp.json()["id"]
+    for inst in instruments:
+        r = client.post(
+            f"/portfolios/{portfolio_id}/positions",
+            json={"instrument_id": inst["id"], "quantity": 100.0},
+        )
+        assert r.status_code == 201, r.text
+    assert len(instruments) == 6
+    return portfolio_id
+
+
+def test_var_engine_segments(client: TestClient):
+    """El motor central responde VaR/ES por segmento con cifras trazables."""
+    portfolio_id = _seed_portfolio(client)
+
+    all_resp = client.post(
+        f"/risk/portfolios/{portfolio_id}/var/engine",
+        json={"confidence_level": 0.95, "horizon_days": 1},
+    )
+    assert all_resp.status_code == 200, all_resp.text
+    data = all_resp.json()
+
+    # Lecturas centrales.
+    assert data["segment"] == "all"
+    assert data["var_value"] > 0
+    assert data["expected_shortfall"] >= data["var_value"]
+    assert data["portfolio_value"] > 0
+
+    # Proveniencia (de dónde salió cada número).
+    assert data["worst_historical_loss"] >= data["expected_shortfall"]
+    assert data["n_observations"] > 100
+    assert data["n_positions"] == 6
+    assert data["n_factors"] == 6
+    assert data["calculation_time_ms"] >= 0
+
+    # Segmentos: cada subconjunto es una fracción estricta del total.
+    for segment, expected_positions in (
+        ("fx", 1),
+        ("equity", 3),
+        ("commodity", 1),
+        ("rate", 1),
+    ):
+        r = client.post(
+            f"/risk/portfolios/{portfolio_id}/var/engine",
+            json={"segment": segment, "confidence_level": 0.95},
+        )
+        assert r.status_code == 200, r.text
+        seg = r.json()
+        assert seg["n_positions"] == expected_positions
+        assert 0 < seg["portfolio_value"] < data["portfolio_value"]
+        assert seg["var_value"] > 0
+        assert seg["expected_shortfall"] >= seg["var_value"]
+
+    # Confianza y horizonte desplazan la cifra.
+    r_high = client.post(
+        f"/risk/portfolios/{portfolio_id}/var/engine",
+        json={"confidence_level": 0.99, "horizon_days": 10},
+    )
+    assert r_high.status_code == 200
+    assert r_high.json()["var_value"] > data["var_value"]
+
+
+def test_var_engine_unknown_segment(client: TestClient):
+    portfolio_id = _seed_portfolio(client)
+    r = client.post(
+        f"/risk/portfolios/{portfolio_id}/var/engine",
+        json={"segment": "metals"},
+    )
+    assert r.status_code == 422
+
+
+def test_var_factors_decomposition(client: TestClient):
+    """La contribución al VaR por factor suma 1 y las clases rollup coinciden."""
+    portfolio_id = _seed_portfolio(client)
+
+    r = client.get(
+        f"/risk/portfolios/{portfolio_id}/var/factors?confidence_level=0.95&horizon_days=1"
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    assert data["portfolio_value"] > 0
+    assert data["total_var"] > 0
+    assert len(data["factors"]) == 6
+
+    shares = sum(f["share"] for f in data["factors"])
+    assert shares == pytest.approx(1.0, abs=1e-5)
+
+    contribs = sum(f["contribution"] for f in data["factors"])
+    assert contribs == pytest.approx(data["total_var"], rel=1e-4)
+
+    cls_rollup = {}
+    for f in data["factors"]:
+        cls_rollup[f["asset_class"]] = cls_rollup.get(f["asset_class"], 0.0) + f["share"]
+    assert {c["asset_class"] for c in data["classes"]} == set(cls_rollup)
+    for c in data["classes"]:
+        assert c["share"] == pytest.approx(cls_rollup[c["asset_class"]], abs=5e-6)
+
+    for f in data["factors"]:
+        assert f["delta"] == pytest.approx(f["exposure"])
+        assert f["gamma"] == 0.0
+        assert f["vega"] == 0.0
+        assert f["annualized_volatility"] > 0
+
+
+def test_stress_report(client: TestClient):
+    """Baseline vs. estresado: P&L = Σ exposición×shock y VaR sube con la pérdida."""
+    portfolio_id = _seed_portfolio(client)
+
+    # 1. Escenario de pérdida: -20% a todo el universo (equity, fx, commodity, rate).
+    instruments = client.get("/etl/instruments").json()
+    shocks = {i["symbol"]: -0.20 for i in instruments}
+    r = client.post(
+        f"/risk/portfolios/{portfolio_id}/stress/report",
+        json={"scenario_name": "crash", "shocks": shocks},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    assert data["n_positions"] == 6
+    assert data["stressed_value"] == pytest.approx(data["baseline_value"] * 0.80, rel=1e-3)
+    assert data["pnl"] == pytest.approx(-data["baseline_value"] * 0.20, rel=1e-3)
+    assert data["var_baseline"] > 0
+    assert data["var_stressed"] >= data["var_baseline"]
+
+    # 2. Escenario de ganancia: el VaR no sube por el shock positivo.
+    r2 = client.post(
+        f"/risk/portfolios/{portfolio_id}/stress/report",
+        json={"scenario_name": "rally", "shocks": {i["symbol"]: 0.20 for i in instruments}},
+    )
+    assert r2.status_code == 200, r2.text
+    d2 = r2.json()
+    assert d2["pnl"] > 0
+    assert d2["stressed_value"] > d2["baseline_value"]
+
+    # 3. Shock por símbolo: solo afecta a ese instrumento (P&L = exposición).
+    sens = client.get(f"/risk/portfolios/{portfolio_id}/sensitivities").json()
+    aapl = next(s for s in sens if s["instrument"] == "AAPL")
+    r3 = client.post(
+        f"/risk/portfolios/{portfolio_id}/stress/report",
+        json={"scenario_name": "single", "shocks": {"AAPL": 1.00}},
+    )
+    assert r3.status_code == 200, r3.text
+    d3 = r3.json()
+    assert d3["pnl"] == pytest.approx(aapl["exposure"], rel=1e-3)
