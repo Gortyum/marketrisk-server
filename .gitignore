@@ -1,0 +1,27 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+
+# Caches de herramientas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Bases de datos locales (se generan automáticamente al arrancar)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Builds / paquetes de Python
+build/
+dist/
+*.egg-info/
+
+# Configuración local (se sobrescribe desde .env; conserva el ejemplo)
+.env
+.env.local
+!.env.example

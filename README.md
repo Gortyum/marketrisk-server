@@ -164,3 +164,31 @@ En `F:\progra\curso\backend`:
 | `COURSE_DATABASE_URL`  | `sqlite:///<proyecto>/market_risk.db` |
 | `COURSE_ALLOW_ORIGINS` | vacío (sin CORS, mismo origen)       |
 | `COURSE_*`             | demás parámetros en `app/config.py`  |
+
+## Despliegue cloud (Railway + Vercel)
+
+Backend → **Railway**, frontend → **Vercel** (orígenes distintos, por eso el
+CORS configurable). El `Procfile` de `backend/` fija el comando de arranque
+(`$PORT` lo inyecta Railway).
+
+Variables a definir en el panel de **Railway**:
+
+| Variable               | Ejemplo                                        |
+| ---------------------- | ---------------------------------------------- |
+| `COURSE_ALLOW_ORIGINS` | `https://market-risk.vercel.app` (o varios, separados por coma) |
+| `COURSE_DATABASE_URL`  | `postgresql+psycopg://user:pass@host:port/db` (si usas Railway Postgres) |
+
+> Sin Postgres queda SQLite (archivo local): funciona, pero en Railway el
+> filesystem es efímero y los datos se pierden al redeployar. Para persistir,
+> añade un plugin Postgres y apunta `COURSE_DATABASE_URL` a su conexión
+> (el código ya es dialect-portable y trae el driver `psycopg`).
+> Origen del deploy de Railway = `backend/`.
+
+Variable a definir en el panel de **Vercel** (se inyecta en el build):
+
+| Variable        | Ejemplo                                   |
+| --------------- | ----------------------------------------- |
+| `VITE_API_BASE` | `https://course-backend.up.railway.app`   |
+
+> Vercel: framework Vite (build `npm run build`, output `dist/`). Sin
+> `VITE_API_BASE`, el bundle llama a la API desde su propio dominio y falla.
